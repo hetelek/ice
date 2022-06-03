@@ -16,3 +16,5 @@ require (
 	golang.org/x/net v0.0.0-20220425223048-2871e0cb64e4
 	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
 )
+
+replace github.com/pion/turn/v2 v2.0.8 => github.com/hetelek/turn/v2 v2.1.0
