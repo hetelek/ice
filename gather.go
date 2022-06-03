@@ -508,7 +508,184 @@ func (a *Agent) gatherCandidatesRelay(ctx context.Context, urls []*URL) { //noli
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	network := NetworkTypeUDP4.String()
+	generateCandidate := func(url URL, ipv6 bool) {
+		defer wg.Done()
+
+		TURNServerAddr := fmt.Sprintf("%s:%d", url.Host, url.Port)
+		var (
+			udpNetworkType string
+			tcpNetworkType string
+			localAddress   string
+			network        string
+
+			locConn       net.PacketConn
+			err           error
+			RelAddr       string
+			RelPort       int
+			relayProtocol string
+		)
+
+		if ipv6 {
+			udpNetworkType = NetworkTypeUDP6.String()
+			tcpNetworkType = NetworkTypeTCP6.String()
+			localAddress = ":"
+		} else {
+			udpNetworkType = NetworkTypeUDP4.String()
+			tcpNetworkType = NetworkTypeTCP4.String()
+			localAddress = "0.0.0.0:0"
+		}
+
+		switch {
+		case url.Proto == ProtoTypeUDP && url.Scheme == SchemeTypeTURN:
+			network = udpNetworkType
+			if locConn, err = a.net.ListenPacket(network, localAddress); err != nil {
+				a.log.Warnf("Failed to listen %s: %v", network, err)
+				return
+			}
+
+			RelAddr = locConn.LocalAddr().(*net.UDPAddr).IP.String() //nolint:forcetypeassert
+			RelPort = locConn.LocalAddr().(*net.UDPAddr).Port        //nolint:forcetypeassert
+			relayProtocol = udp
+		case a.proxyDialer != nil && url.Proto == ProtoTypeTCP &&
+			(url.Scheme == SchemeTypeTURN || url.Scheme == SchemeTypeTURNS):
+			network = tcpNetworkType
+			conn, connectErr := a.proxyDialer.Dial(network, TURNServerAddr)
+			if connectErr != nil {
+				a.log.Warnf("Failed to Dial TCP Addr %s via proxy dialer: %v", TURNServerAddr, connectErr)
+				return
+			}
+
+			RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
+			RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
+			if url.Scheme == SchemeTypeTURN {
+				relayProtocol = tcp
+			} else if url.Scheme == SchemeTypeTURNS {
+				relayProtocol = "tls"
+			}
+			locConn = turn.NewSTUNConn(conn)
+
+		case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURN:
+			network = tcpNetworkType
+			tcpAddr, connectErr := net.ResolveTCPAddr(network, TURNServerAddr)
+			if connectErr != nil {
+				a.log.Warnf("Failed to resolve TCP Addr %s: %v", TURNServerAddr, connectErr)
+				return
+			}
+
+			conn, connectErr := net.DialTCP(network, nil, tcpAddr)
+			if connectErr != nil {
+				a.log.Warnf("Failed to Dial TCP Addr %s: %v", TURNServerAddr, connectErr)
+				return
+			}
+
+			RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
+			RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
+			relayProtocol = tcp
+			locConn = turn.NewSTUNConn(conn)
+		case url.Proto == ProtoTypeUDP && url.Scheme == SchemeTypeTURNS:
+			network = udpNetworkType
+			udpAddr, connectErr := net.ResolveUDPAddr(network, TURNServerAddr)
+			if connectErr != nil {
+				a.log.Warnf("Failed to resolve UDP Addr %s: %v", TURNServerAddr, connectErr)
+				return
+			}
+
+			conn, connectErr := dtls.Dial(network, udpAddr, &dtls.Config{
+				ServerName:         url.Host,
+				InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
+			})
+			if connectErr != nil {
+				a.log.Warnf("Failed to Dial DTLS Addr %s: %v", TURNServerAddr, connectErr)
+				return
+			}
+
+			RelAddr = conn.LocalAddr().(*net.UDPAddr).IP.String() //nolint:forcetypeassert
+			RelPort = conn.LocalAddr().(*net.UDPAddr).Port        //nolint:forcetypeassert
+			relayProtocol = "dtls"
+			locConn = &fakePacketConn{conn}
+		case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURNS:
+			network = tcpNetworkType
+			conn, connectErr := tls.Dial(network, TURNServerAddr, &tls.Config{
+				InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
+			})
+			if connectErr != nil {
+				a.log.Warnf("Failed to Dial TLS Addr %s: %v", TURNServerAddr, connectErr)
+				return
+			}
+			RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
+			RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
+			relayProtocol = "tls"
+			locConn = turn.NewSTUNConn(conn)
+		default:
+			a.log.Warnf("Unable to handle URL in gatherCandidatesRelay %v", url)
+			return
+		}
+
+		client, err := turn.NewClient(&turn.ClientConfig{
+			TURNServerAddr: TURNServerAddr,
+			Conn:           locConn,
+			Username:       url.Username,
+			Password:       url.Password,
+			LoggerFactory:  a.loggerFactory,
+			Net:            a.net,
+			IPv6:           ipv6,
+		})
+		if err != nil {
+			closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to build new turn.Client %s %s", TURNServerAddr, err))
+			return
+		}
+
+		if err = client.Listen(); err != nil {
+			client.Close()
+			closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to listen on turn.Client %s %s", TURNServerAddr, err))
+			return
+		}
+
+		relayConn, err := client.Allocate()
+		if err != nil {
+			client.Close()
+			closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to allocate on turn.Client %s %s", TURNServerAddr, err))
+			return
+		}
+
+		raddr := relayConn.LocalAddr().(*net.UDPAddr) //nolint:forcetypeassert
+		relayConfig := CandidateRelayConfig{
+			Network:       network,
+			Component:     ComponentRTP,
+			Address:       raddr.IP.String(),
+			Port:          raddr.Port,
+			RelAddr:       RelAddr,
+			RelPort:       RelPort,
+			RelayProtocol: relayProtocol,
+			OnClose: func() error {
+				client.Close()
+				return locConn.Close()
+			},
+		}
+		relayConnClose := func() {
+			if relayConErr := relayConn.Close(); relayConErr != nil {
+				a.log.Warnf("Failed to close relay %v", relayConErr)
+			}
+		}
+		candidate, err := NewCandidateRelay(&relayConfig)
+		if err != nil {
+			relayConnClose()
+
+			client.Close()
+			closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to create relay candidate: %s %s: %v", network, raddr.String(), err))
+			return
+		}
+
+		if err := a.addCandidate(ctx, candidate, relayConn); err != nil {
+			relayConnClose()
+
+			if closeErr := candidate.close(); closeErr != nil {
+				a.log.Warnf("Failed to close candidate: %v", closeErr)
+			}
+			a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v", err)
+		}
+	}
+
 	for i := range urls {
 		switch {
 		case urls[i].Scheme != SchemeTypeTURN && urls[i].Scheme != SchemeTypeTURNS:
@@ -521,161 +698,12 @@ func (a *Agent) gatherCandidatesRelay(ctx context.Context, urls []*URL) { //noli
 			return
 		}
 
+		// ipv4
 		wg.Add(1)
-		go func(url URL) {
-			defer wg.Done()
-			TURNServerAddr := fmt.Sprintf("%s:%d", url.Host, url.Port)
-			var (
-				locConn       net.PacketConn
-				err           error
-				RelAddr       string
-				RelPort       int
-				relayProtocol string
-			)
+		go generateCandidate(*urls[i], false)
 
-			switch {
-			case url.Proto == ProtoTypeUDP && url.Scheme == SchemeTypeTURN:
-				if locConn, err = a.net.ListenPacket(network, "0.0.0.0:0"); err != nil {
-					a.log.Warnf("Failed to listen %s: %v", network, err)
-					return
-				}
-
-				RelAddr = locConn.LocalAddr().(*net.UDPAddr).IP.String() //nolint:forcetypeassert
-				RelPort = locConn.LocalAddr().(*net.UDPAddr).Port        //nolint:forcetypeassert
-				relayProtocol = udp
-			case a.proxyDialer != nil && url.Proto == ProtoTypeTCP &&
-				(url.Scheme == SchemeTypeTURN || url.Scheme == SchemeTypeTURNS):
-				conn, connectErr := a.proxyDialer.Dial(NetworkTypeTCP4.String(), TURNServerAddr)
-				if connectErr != nil {
-					a.log.Warnf("Failed to Dial TCP Addr %s via proxy dialer: %v", TURNServerAddr, connectErr)
-					return
-				}
-
-				RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
-				RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
-				if url.Scheme == SchemeTypeTURN {
-					relayProtocol = tcp
-				} else if url.Scheme == SchemeTypeTURNS {
-					relayProtocol = "tls"
-				}
-				locConn = turn.NewSTUNConn(conn)
-
-			case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURN:
-				tcpAddr, connectErr := net.ResolveTCPAddr(NetworkTypeTCP4.String(), TURNServerAddr)
-				if connectErr != nil {
-					a.log.Warnf("Failed to resolve TCP Addr %s: %v", TURNServerAddr, connectErr)
-					return
-				}
-
-				conn, connectErr := net.DialTCP(NetworkTypeTCP4.String(), nil, tcpAddr)
-				if connectErr != nil {
-					a.log.Warnf("Failed to Dial TCP Addr %s: %v", TURNServerAddr, connectErr)
-					return
-				}
-
-				RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
-				RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
-				relayProtocol = tcp
-				locConn = turn.NewSTUNConn(conn)
-			case url.Proto == ProtoTypeUDP && url.Scheme == SchemeTypeTURNS:
-				udpAddr, connectErr := net.ResolveUDPAddr(network, TURNServerAddr)
-				if connectErr != nil {
-					a.log.Warnf("Failed to resolve UDP Addr %s: %v", TURNServerAddr, connectErr)
-					return
-				}
-
-				conn, connectErr := dtls.Dial(network, udpAddr, &dtls.Config{
-					ServerName:         url.Host,
-					InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
-				})
-				if connectErr != nil {
-					a.log.Warnf("Failed to Dial DTLS Addr %s: %v", TURNServerAddr, connectErr)
-					return
-				}
-
-				RelAddr = conn.LocalAddr().(*net.UDPAddr).IP.String() //nolint:forcetypeassert
-				RelPort = conn.LocalAddr().(*net.UDPAddr).Port        //nolint:forcetypeassert
-				relayProtocol = "dtls"
-				locConn = &fakePacketConn{conn}
-			case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURNS:
-				conn, connectErr := tls.Dial(NetworkTypeTCP4.String(), TURNServerAddr, &tls.Config{
-					InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
-				})
-				if connectErr != nil {
-					a.log.Warnf("Failed to Dial TLS Addr %s: %v", TURNServerAddr, connectErr)
-					return
-				}
-				RelAddr = conn.LocalAddr().(*net.TCPAddr).IP.String() //nolint:forcetypeassert
-				RelPort = conn.LocalAddr().(*net.TCPAddr).Port        //nolint:forcetypeassert
-				relayProtocol = "tls"
-				locConn = turn.NewSTUNConn(conn)
-			default:
-				a.log.Warnf("Unable to handle URL in gatherCandidatesRelay %v", url)
-				return
-			}
-
-			client, err := turn.NewClient(&turn.ClientConfig{
-				TURNServerAddr: TURNServerAddr,
-				Conn:           locConn,
-				Username:       url.Username,
-				Password:       url.Password,
-				LoggerFactory:  a.loggerFactory,
-				Net:            a.net,
-			})
-			if err != nil {
-				closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to build new turn.Client %s %s", TURNServerAddr, err))
-				return
-			}
-
-			if err = client.Listen(); err != nil {
-				client.Close()
-				closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to listen on turn.Client %s %s", TURNServerAddr, err))
-				return
-			}
-
-			relayConn, err := client.Allocate()
-			if err != nil {
-				client.Close()
-				closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to allocate on turn.Client %s %s", TURNServerAddr, err))
-				return
-			}
-
-			raddr := relayConn.LocalAddr().(*net.UDPAddr) //nolint:forcetypeassert
-			relayConfig := CandidateRelayConfig{
-				Network:       network,
-				Component:     ComponentRTP,
-				Address:       raddr.IP.String(),
-				Port:          raddr.Port,
-				RelAddr:       RelAddr,
-				RelPort:       RelPort,
-				RelayProtocol: relayProtocol,
-				OnClose: func() error {
-					client.Close()
-					return locConn.Close()
-				},
-			}
-			relayConnClose := func() {
-				if relayConErr := relayConn.Close(); relayConErr != nil {
-					a.log.Warnf("Failed to close relay %v", relayConErr)
-				}
-			}
-			candidate, err := NewCandidateRelay(&relayConfig)
-			if err != nil {
-				relayConnClose()
-
-				client.Close()
-				closeConnAndLog(locConn, a.log, fmt.Sprintf("Failed to create relay candidate: %s %s: %v", network, raddr.String(), err))
-				return
-			}
-
-			if err := a.addCandidate(ctx, candidate, relayConn); err != nil {
-				relayConnClose()
-
-				if closeErr := candidate.close(); closeErr != nil {
-					a.log.Warnf("Failed to close candidate: %v", closeErr)
-				}
-				a.log.Warnf("Failed to append to localCandidates and run onCandidateHdlr: %v", err)
-			}
-		}(*urls[i])
+		// ipv6
+		wg.Add(1)
+		go generateCandidate(*urls[i], true)
 	}
 }
