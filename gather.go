@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	stunGatherTimeout = time.Second * 5
+	stunGatherTimeout      = time.Second * 5
+	maxIPv4LookupsPerRelay = 5
+	maxIPv6LookupsPerRelay = 5
 )
 
 type closeable interface {
@@ -701,12 +703,40 @@ func (a *Agent) gatherCandidatesRelay(ctx context.Context, urls []*URL) { //noli
 
 		url := *urls[i]
 
-		// ipv4
-		wg.Add(1)
-		go generateCandidate(url, false)
+		var targetIPs []net.IP
+		var err error
+		if hostIP := net.ParseIP(url.Host); hostIP != nil {
+			// literal IP provided
+			targetIPs = []net.IP{hostIP}
+		} else {
+			// hostname provided, perform DNS lookup
+			targetIPs, err = net.LookupIP(url.Host)
+			if err != nil {
+				a.log.Warnf("Failed to lookup host IPs: %v", err)
+				continue
+			}
+		}
 
-		// ipv6
-		wg.Add(1)
-		go generateCandidate(url, true)
+		ipv4Lookups := 0
+		ipv6Lookups := 0
+		for _, ip := range targetIPs {
+			if ipv4 := ip.To4(); ipv4 != nil && ipv4Lookups < maxIPv4LookupsPerRelay {
+				ipv4Lookups += 1
+				var urlCopy URL = url
+				urlCopy.Host = ipv4.String()
+
+				wg.Add(1)
+				go generateCandidate(urlCopy, false)
+			} else if ipv6 := ip.To16(); ipv6 != nil && ipv6Lookups < maxIPv6LookupsPerRelay {
+				ipv6Lookups += 1
+				var urlCopy URL = url
+				urlCopy.Host = ipv6.String()
+
+				wg.Add(1)
+				go generateCandidate(urlCopy, true)
+			} else if ipv6Lookups >= maxIPv6LookupsPerRelay && ipv4Lookups >= maxIPv4LookupsPerRelay {
+				break
+			}
+		}
 	}
 }
